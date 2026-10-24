@@ -8,6 +8,8 @@ import SwiftUI
 // Selective import: `import SideSign` would make `Account`/`Team`/`TeamType`
 // ambiguous with the StosSign_Common types used by the App ID/signing UI.
 import class SideSign.AnisetteDataManager
+import enum SideSign.ServerError
+import enum SideSign.DeveloperPortalError
 import StosSign_API
 import StosSign_Auth
 import StosSign_Common
@@ -175,6 +177,60 @@ enum AnisetteProviderState {
     }
 }
 
+/// Repairs Anisette state Apple will not accept any more.
+///
+/// Provisioning data (adi.pb) plus the identifier that minted it are one identity.
+/// Apple refuses a Mac-profile identity outright, and a blob the server can no
+/// longer validate cannot be fixed in place, so the only repair is to forget the
+/// pair and let the next sign in provision a fresh Windows identity.
+enum AnisetteRecovery {
+    /// Drops the identity, cached Anisette data and the recorded provider.
+    static func purgeIdentity() {
+        Keychain.shared.adiPb = nil
+        Keychain.shared.identifier = nil
+        AnisetteDataHelper.shared.resetClientInfo()
+        SideSign.AnisetteDataManager.shared.clearCache()
+        AnisetteProviderState.reset()
+    }
+
+    /// True only for failures that mean "this identity is no longer usable".
+    /// Ordinary network errors, a wrong password or a cancelled 2FA must keep
+    /// the identity, otherwise every retry would reprovision from scratch.
+    static func shouldPurge(after error: Error) -> Bool {
+        if let serverError = error as? ServerError {
+            switch serverError {
+            case .underlyingError(let code, _):
+                return RefusalCodes.codes.contains(code)
+            case .badServerResponse(let reason, _):
+                // SideSign reports a refused GrandSlam connection as a bad server
+                // response whose reason carries the HTTP status.
+                return RefusalCodes.statuses.contains { reason.contains("HTTP \($0)") }
+            case .invalidResponseFormat, .missingKey:
+                return false
+            }
+        }
+
+        if let portalError = error as? DeveloperPortalError,
+           case .invalidAnisetteData(_) = portalError {
+            return true
+        }
+
+        // AnisetteDataHelper reports server-side provisioning failures as plain
+        // strings, so match those explicitly instead of guessing from prose.
+        if let message = error as? String {
+            return RefusalCodes.messages.contains { message.contains($0) }
+        }
+
+        return false
+    }
+
+    private enum RefusalCodes {
+        static let codes = [-80045, -80046]
+        static let statuses = [433, 503]
+        static let messages = ["-80045", "-80046", "not provisioned"]
+    }
+}
+
 enum AnisetteSettingsMigrator {
     private static let versionKey = "AnisetteSettingsMigrationVersion"
     private static let currentVersion = 1
@@ -196,6 +252,11 @@ enum AnisetteSettingsMigrator {
         if storedClientInfo == AnisetteClientInfo.legacyRemoteDefault {
             defaults.removeObject(forKey: AnisetteClientInfo.defaultsKey)
         }
+
+        // The stored identity is deliberately kept: it may be an imported
+        // SideStore account. A stale or Mac-profile blob is dropped by
+        // AnisetteRecovery when Apple actually refuses it, which covers upgrades
+        // without throwing away a working identity.
 
         // `UseOnDeviceAnisette` is intentionally left untouched: an unset value
         // already means "remote Windows v3 server" (the new default), while users

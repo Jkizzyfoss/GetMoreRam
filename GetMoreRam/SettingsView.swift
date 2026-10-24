@@ -64,7 +64,7 @@ struct SettingsView: View {
                         .disableAutocorrection(true)
                 }
             } footer: {
-                Text("Generates Anisette on the iPhone like SideStore. The first run downloads the small ODA runtime package and then talks to Apple without an Anisette server. Leave the client info empty to use the built-in Windows profile; Apple currently rejects Mac/Android identities with error -80045/-80046, so a non-Windows value is ignored.")
+                Text("Generates Anisette on the iPhone like SideStore. The first run downloads the small ODA runtime package and then talks to Apple without an Anisette server. Leave the client info empty to use the built-in Windows profile; Apple currently rejects Mac/Android identities with error -80045/-80046, so a non-Windows value is ignored. If sign-in still returns -80045/-80046, turn this off and use a Windows Anisette server instead.")
             }
 
             Section {
@@ -75,7 +75,7 @@ struct SettingsView: View {
                         .multilineTextAlignment(.trailing)
                 }
             } footer: {
-                Text("Use a v3 server that serves Windows Anisette data, for example https://ani.jkcoxson.com or https://ani2.stikstore.app. It must match the client info above. Changing the server requests a fresh Anisette identity on the next sign in.")
+                Text("Use a v3 server that serves Windows Anisette data, for example https://ani.jkcoxson.com or https://win.ani.sidestore.io. Changing the server requests a fresh Anisette identity on the next sign in. The app always reports the Windows client identity to Apple, whatever the server advertises.")
             }
             
             Section {

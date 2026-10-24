@@ -383,19 +383,15 @@ final class AnisetteDataHelper
             return
         }
         
-        // Ask the configured v3 server which client profile minted its ADI data.
-        // Reporting a different profile to GrandSlam than the one behind the
-        // Anisette headers is exactly what produced -80045/-80046.
-        var resolvedClientInfo = AnisetteClientInfo.sanitized(
+        // Always the Windows profile: Apple rejects Mac/Android identities on
+        // GrandSlam, and the Windows ADI servers still advertise a Mac profile in
+        // /v3/client_info, so trusting that value would reintroduce -80045/-80046.
+        // SideSign reports the same Windows identity for the auth request itself,
+        // so the headers here and the payload there cannot disagree.
+        self.clientInfo = AnisetteClientInfo.sanitized(
             AnisetteClientInfo.resolved(fallback: fallbackClientInfo),
             fallback: fallbackClientInfo)
-        var resolvedUserAgent = fallbackUserAgent
-        if let advertised = await fetchAdvertisedClientIdentity() {
-            resolvedClientInfo = advertised.clientInfo
-            resolvedUserAgent = advertised.userAgent
-        }
-        self.clientInfo = resolvedClientInfo
-        self.userAgent = resolvedUserAgent.isEmpty ? fallbackUserAgent : resolvedUserAgent
+        self.userAgent = fallbackUserAgent
         self.printOut("Client-Info: \(self.clientInfo!)")
         self.printOut("User-Agent: \(self.userAgent!)")
         
@@ -420,39 +416,6 @@ final class AnisetteDataHelper
         self.printOut("X-Mme-Device-Id: \(self.deviceId!)")
     }
 
-    /// Reads `<server>/v3/client_info`. Returns nil when the server does not
-    /// advertise a Windows-compatible profile, so the caller keeps the built-in
-    /// Windows identity instead of announcing a Mac/Android device that Apple
-    /// would reject while the Anisette data came from somewhere else.
-    private func fetchAdvertisedClientIdentity() async -> (clientInfo: String, userAgent: String)? {
-        guard let base = self.url ?? AnisetteSettings.serverURL else { return nil }
-        let clientInfoURL = base.appendingPathComponent("v3").appendingPathComponent("client_info")
-
-        do {
-            let (data, response) = try await self.session.data(from: clientInfoURL)
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                self.printOut("Server exposed no /v3/client_info (HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1))")
-                return nil
-            }
-            guard let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] else {
-                self.printOut("/v3/client_info did not return JSON")
-                return nil
-            }
-            let clientInfo = AnisetteClientInfo.sanitized(json["client_info"] as? String, fallback: "")
-            guard !clientInfo.isEmpty else {
-                self.printOut("/v3/client_info advertises a non-Windows identity; using the built-in Windows profile")
-                return nil
-            }
-            let userAgent = (json["user_agent"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            self.printOut("Server client_info: \(clientInfo) user_agent: \(userAgent)")
-            return (clientInfo, userAgent)
-        } catch {
-            self.printOut("Failed to read /v3/client_info: \(error)")
-            return nil
-        }
-    }
-    
     func fetchAnisetteV3(_ identifier: String, _ adiPb: String) async throws -> AnisetteData {
         try await fetchClientInfo()
         self.printOut("Fetching anisette V3")
