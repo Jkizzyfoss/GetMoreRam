@@ -91,6 +91,10 @@ enum SideStoreAccountImporter {
         Keychain.shared.adiPb = adiPB
         Keychain.shared.identifier = localUser
         AnisetteDataHelper.shared.resetClientInfo()
+        // The imported identity must survive the next login, so forget which
+        // provider produced the previous data; otherwise it looks like a provider
+        // switch and the credentials are discarded.
+        OnDeviceAnisetteHelper.shared.resetProviderState()
         
         return SideStoreAccount(email: email, password: password, adiPB: adiPB, localUser: localUser)
     }

@@ -2,9 +2,18 @@
 //  OnDeviceAnisetteHelper.swift
 //  GetMoreRam
 //
-//  Uses the same on-device ADI path as SideStore. No Anisette HTTP server is
-//  used for authentication: after the ODA libraries are cached, the headers
-//  are generated locally by AnisetteKit on the device.
+//  Bridge between GetMoreRam and SideSign/AnisetteKit for obtaining anisette
+//  data in the two supported configurations:
+//
+//   * on-device — the ADI libraries are cached and executed locally through
+//     SideSign's `.remoteODA` mode (no Anisette HTTP server involved).
+//   * remote    — a normal v3 Anisette server is queried through
+//     AnisetteDataHelper. The server's advertised client profile is used so the
+//     Anisette headers always match the identity reported to GrandSlam.
+//
+//  Both paths keep the device identifier and adi.pb in the Keychain and only
+//  reprovision when Apple explicitly says the provisioning data is stale, or when
+//  the provider itself changed.
 //
 
 import Foundation
@@ -22,26 +31,20 @@ final class OnDeviceAnisetteHelper {
 
     private init() {}
 
-    func getAnisetteData() async throws -> StosSign_Common.AnisetteData {
-        try convert(await getSideSignAnisetteData())
-    }
+    // MARK: - On-device (ODA)
 
+    /// Anisette data generated locally by the cached ADI libraries.
     func getSideSignAnisetteData() async throws -> SideSign.AnisetteData {
+        // The on-device option is its own provider: switching to/away from it
+        // invalidates any identity provisioned against the previous provider.
+        AnisetteProviderState.updateProvider("ondevice")
+
         let identifier = try ensureIdentifier()
         let existingBlob = Keychain.shared.adiPb.flatMap {
             Data(base64Encoded: $0, options: .ignoreUnknownCharacters)
         }
 
-        // AnisetteKit otherwise supplies a constant placeholder local-user ID.
-        // Bind LU and device ID to the same bytes used by the ADI provider.
-        var identifierBytes = identifier.uuid
-        let identifierData = withUnsafeBytes(of: &identifierBytes) { Data($0) }
-        let requestHeaders = AnisetteRequestHeaders.defaultHeaders.with {
-            $0.clientInfo = AnisetteClientInfo.resolved(fallback: AnisetteClientInfo.onDeviceDefault)
-            $0.deviceID = identifier.uuidString.uppercased()
-            $0.localUserID = SHA256.hash(data: identifierData)
-                .map { String(format: "%02X", $0) }.joined()
-        }
+        let requestHeaders = makeRequestHeaders(identifier: identifier)
 
         do {
             let result = try await fetch(
@@ -69,6 +72,59 @@ final class OnDeviceAnisetteHelper {
                 Keychain.shared.adiPb = newBlob.base64EncodedString()
             }
             return result.data
+        }
+    }
+
+    // MARK: - Remote (v3 Anisette server)
+
+    /// Anisette data from the configured remote v3 Anisette server.
+    func getRemoteSideSignAnisetteData() async throws -> SideSign.AnisetteData {
+        guard let serverURL = AnisetteSettings.serverURL else {
+            throw NSError(
+                domain: "GetMoreRam.Anisette",
+                code: -10,
+                userInfo: [NSLocalizedDescriptionKey: "No Anisette server is configured."]
+            )
+        }
+
+        // The ADI identity is bound to the provider that minted it, so a server
+        // switch needs a fresh identity/adi.pb. This never fires for a plain
+        // network error against the same server.
+        AnisetteProviderState.updateProvider("remote:\(serverURL.absoluteString)")
+
+        let helper = AnisetteDataHelper.shared
+        helper.url = serverURL
+        try await helper.fetchClientInfo()
+
+        let stosSignAnisette = try await helper.getAnisetteData()
+        return convertToSideSign(
+            stosSignAnisette,
+            clientInfo: helper.clientInfo ?? AnisetteClientInfo.remoteDefault,
+            userAgent: helper.userAgent ?? AnisetteClientInfo.windowsUserAgent
+        )
+    }
+
+    // MARK: - SideSign / AnisetteKit plumbing
+
+    /// Drops cached provider state (in-memory Anisette cache + recorded provider).
+    func resetProviderState() {
+        provider.clearCache()
+        AnisetteProviderState.reset()
+    }
+
+    private func makeRequestHeaders(identifier: UUID) -> AnisetteRequestHeaders {
+        // AnisetteKit otherwise supplies a constant placeholder local-user ID.
+        // Bind LU and device ID to the same bytes used by the ADI provider.
+        var identifierBytes = identifier.uuid
+        let identifierData = withUnsafeBytes(of: &identifierBytes) { Data($0) }
+        return AnisetteRequestHeaders.defaultHeaders.with {
+            $0.clientInfo = AnisetteClientInfo.sanitized(
+                AnisetteClientInfo.resolved(fallback: AnisetteClientInfo.onDeviceDefault),
+                fallback: AnisetteClientInfo.onDeviceDefault)
+            $0.userAgent = AnisetteClientInfo.windowsUserAgent
+            $0.deviceID = identifier.uuidString.uppercased()
+            $0.localUserID = SHA256.hash(data: identifierData)
+                .map { String(format: "%02X", $0) }.joined()
         }
     }
 
@@ -123,6 +179,28 @@ final class OnDeviceAnisetteHelper {
             guard let baseAddress = rawBuffer.baseAddress else { return nil }
             return UUID(uuid: baseAddress.load(as: uuid_t.self))
         }
+    }
+
+    /// Converts remote anisette data (StosSign model) into the SideSign model that
+    /// `DeveloperPortal.authenticate` consumes, keeping the client identity that
+    /// matches the server that produced it.
+    func convertToSideSign(_ data: StosSign_Common.AnisetteData,
+                           clientInfo: String,
+                           userAgent: String) -> SideSign.AnisetteData {
+        let dateFormatter = ISO8601DateFormatter()
+        return SideSign.AnisetteData(
+            machineID: data.machineID,
+            oneTimePassword: data.oneTimePassword,
+            localUserID: data.localUserID,
+            routingInfo: String(data.routingInfo),
+            deviceID: data.deviceUniqueIdentifier,
+            serialNumber: data.deviceSerialNumber,
+            clientInfo: AnisetteClientInfo.sanitized(clientInfo, fallback: AnisetteClientInfo.remoteDefault),
+            userAgent: userAgent.isEmpty ? AnisetteClientInfo.windowsUserAgent : userAgent,
+            clientTime: dateFormatter.string(from: data.date),
+            locale: data.locale.identifier,
+            timeZone: data.timeZone.abbreviation() ?? data.timeZone.identifier
+        )
     }
 
     func convert(_ data: SideSign.AnisetteData) throws -> StosSign_Common.AnisetteData {

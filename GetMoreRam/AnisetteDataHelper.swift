@@ -26,12 +26,24 @@ final class AnisetteDataHelper
     var mdLu: String?
     var deviceId: String?
     
-    var menuAnisetteURL: String?
-    
     static var shared: AnisetteDataHelper = AnisetteDataHelper()
     
     var loggingFunc: ((String)->Void)?
     
+    // Anisette / provisioning traffic uses an ephemeral session with no connection
+    // reuse: a reused keep-alive connection is a common source of intermittent
+    // 5xx or empty responses from Apple's auth hosts.
+    private lazy var session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldUsePipelining = false
+        configuration.httpMaximumConnectionsPerHost = 1
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
+        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForResource = 120
+        return URLSession(configuration: configuration)
+    }()
+
     func resetClientInfo() {
         clientInfo = nil
         userAgent = nil
@@ -41,19 +53,14 @@ final class AnisetteDataHelper
     
     func getAnisetteData(refresh: Bool = false) async throws -> AnisetteData
     {
-        // SideStore's on-device mode executes the ADI libraries inside the
-        // app. It does not depend on an Anisette HTTP/WebSocket server.
-        if UserDefaults.standard.object(forKey: "UseOnDeviceAnisette") == nil ||
-            UserDefaults.standard.bool(forKey: "UseOnDeviceAnisette") {
-            self.printOut("Using on-device Anisette provider")
-            return try await OnDeviceAnisetteHelper.shared.getAnisetteData()
-        }
-
-        if url == nil {
+        // Always a remote v3 server here: the on-device (ODA) path is owned by
+        // OnDeviceAnisetteHelper, so this helper never branches on the toggle.
+        guard let serverURL = url ?? AnisetteSettings.serverURL else {
             throw "No Anisette Server Found!"
         }
+        self.url = serverURL
         
-        self.printOut("Anisette URL: \(self.url!.absoluteString)")
+        self.printOut("Anisette URL: \(serverURL.absoluteString)")
         
         let ans : AnisetteData
         if let identifier = Keychain.shared.identifier,
@@ -65,6 +72,26 @@ final class AnisetteDataHelper
         return ans
     }
     
+    /// Apple's auth/provisioning hosts occasionally answer HTTP 429/503. Retry a
+    /// small, bounded number of times with backoff rather than surfacing a
+    /// misleading generic connection error.
+    private func dataWithRetry(for request: URLRequest,
+                               retryDelays: [UInt64] = [2_000_000_000, 5_000_000_000]) async throws -> (Data, URLResponse) {
+        var attempt = 0
+        while true {
+            let (data, response) = try await self.session.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if (statusCode == 429 || statusCode == 503), attempt < retryDelays.count {
+                let delay = retryDelays[attempt]
+                self.printOut("Anisette request HTTP \(statusCode) — retrying in \(delay / 1_000_000_000)s (attempt \(attempt + 1))")
+                try await Task.sleep(nanoseconds: delay)
+                attempt += 1
+                continue
+            }
+            return (data, response)
+        }
+    }
+
     // MARK: - COMMON
     
     func extractAnisetteData(_ data: Data, _ response: HTTPURLResponse?, v3: Bool) async throws -> AnisetteData {
@@ -154,7 +181,7 @@ final class AnisetteDataHelper
             self.printOut("Getting provisioning URLs")
             var request = self.buildAppleRequest(url: URL(string: "https://gsa.apple.com/grandslam/GsService2/lookup")!)
             request.httpMethod = "GET"
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await self.dataWithRetry(for: request)
         if
            let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? Dictionary<String, Dictionary<String, Any>>,
            let startProvisioningString = plist["urls"]?["midStartProvisioning"] as? String,
@@ -179,7 +206,7 @@ final class AnisetteDataHelper
         let provisioningSessionURL = self.webSocketURL(from: self.url!.appendingPathComponent("v3").appendingPathComponent("provisioning_session"))
         var wsRequest = URLRequest(url: provisioningSessionURL)
         wsRequest.timeoutInterval = 5
-        let socket = URLSession.shared.webSocketTask(with: wsRequest)
+        let socket = self.session.webSocketTask(with: wsRequest)
         self.socket = socket
         socket.resume()
         try await self.receiveProvisioningMessages(from: socket)
@@ -271,7 +298,7 @@ final class AnisetteDataHelper
         request.httpMethod = "POST"
         request.httpBody = try PropertyListSerialization.data(fromPropertyList: body, format: .xml, options: 0)
         
-        let (data, _) = try await URLSession.shared.data(for: request)
+        let (data, _) = try await self.dataWithRetry(for: request)
         if let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? Dictionary<String, Dictionary<String, Any>>,
            let spim = plist["Response"]?["spim"] as? String {
             return spim
@@ -292,7 +319,7 @@ final class AnisetteDataHelper
         request.httpMethod = "POST"
         request.httpBody = try PropertyListSerialization.data(fromPropertyList: body, format: .xml, options: 0)
         
-        let (data, _) = try await URLSession.shared.data(for: request)
+        let (data, _) = try await self.dataWithRetry(for: request)
         if let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? Dictionary<String, Dictionary<String, Any>>,
            let ptm = plist["Response"]?["ptm"] as? String,
            let tk = plist["Response"]?["tk"] as? String {
@@ -343,9 +370,11 @@ final class AnisetteDataHelper
     // MARK: - V3: FETCHING
     
     func fetchClientInfo() async throws {
-        self.clientInfo = AnisetteClientInfo.resolved(fallback: AnisetteClientInfo.remoteDefault)
+        let fallbackClientInfo = AnisetteClientInfo.remoteDefault
+        let fallbackUserAgent = AnisetteClientInfo.windowsUserAgent
 
-        if  self.userAgent != nil &&
+        if  self.clientInfo != nil &&
+                self.userAgent != nil &&
                 self.mdLu != nil &&
                 self.deviceId != nil &&
                 Keychain.shared.identifier != nil {
@@ -354,9 +383,19 @@ final class AnisetteDataHelper
             return
         }
         
-        self.printOut("Using custom client_info")
-                        
-        self.userAgent = "AuthKit/1 (Macintosh; OS X 27.0) (com.apple.akd/1.0)"
+        // Ask the configured v3 server which client profile minted its ADI data.
+        // Reporting a different profile to GrandSlam than the one behind the
+        // Anisette headers is exactly what produced -80045/-80046.
+        var resolvedClientInfo = AnisetteClientInfo.sanitized(
+            AnisetteClientInfo.resolved(fallback: fallbackClientInfo),
+            fallback: fallbackClientInfo)
+        var resolvedUserAgent = fallbackUserAgent
+        if let advertised = await fetchAdvertisedClientIdentity() {
+            resolvedClientInfo = advertised.clientInfo
+            resolvedUserAgent = advertised.userAgent
+        }
+        self.clientInfo = resolvedClientInfo
+        self.userAgent = resolvedUserAgent.isEmpty ? fallbackUserAgent : resolvedUserAgent
         self.printOut("Client-Info: \(self.clientInfo!)")
         self.printOut("User-Agent: \(self.userAgent!)")
         
@@ -379,56 +418,44 @@ final class AnisetteDataHelper
         let uuid: UUID = decoded.object()
         self.deviceId = uuid.uuidString.uppercased()
         self.printOut("X-Mme-Device-Id: \(self.deviceId!)")
+    }
 
-        // Client info on Anisette Servers are out of date for latest GSA
-        /*
-        let clientInfoURL = self.url!.appendingPathComponent("v3").appendingPathComponent("client_info")
-        
-        let (data, response) = try await URLSession.shared.data(from: clientInfoURL)
-        
+    /// Reads `<server>/v3/client_info`. Returns nil when the server does not
+    /// advertise a Windows-compatible profile, so the caller keeps the built-in
+    /// Windows identity instead of announcing a Mac/Android device that Apple
+    /// would reject while the Anisette data came from somewhere else.
+    private func fetchAdvertisedClientIdentity() async -> (clientInfo: String, userAgent: String)? {
+        guard let base = self.url ?? AnisetteSettings.serverURL else { return nil }
+        let clientInfoURL = base.appendingPathComponent("v3").appendingPathComponent("client_info")
 
-            do {
-                
-                if let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: String] {
-                    if let clientInfo = json["client_info"] {
-                        self.printOut("Server is V3")
-                        
-                        self.clientInfo = clientInfo
-                        self.userAgent = json["user_agent"]!
-                        self.printOut("Client-Info: \(self.clientInfo!)")
-                        self.printOut("User-Agent: \(self.userAgent!)")
-                        
-                        if Keychain.shared.identifier == nil {
-                            self.printOut("Generating identifier")
-                            var bytes = [Int8](repeating: 0, count: 16)
-                            let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-                            
-                            if status != errSecSuccess {
-                                self.printOut("ERROR GENERATING IDENTIFIER!!! \(status)")
-                                throw "Couldn't generate identifier"
-                            }
-                            
-                            Keychain.shared.identifier = Data(bytes: &bytes, count: bytes.count).base64EncodedString()
-                        }
-                        
-                        let decoded = Data(base64Encoded: Keychain.shared.identifier!)!
-                        self.mdLu = decoded.sha256().hexEncodedString()
-                        self.printOut("X-Apple-I-MD-LU: \(self.mdLu!)")
-                        let uuid: UUID = decoded.object()
-                        self.deviceId = uuid.uuidString.uppercased()
-                        self.printOut("X-Mme-Device-Id: \(self.deviceId!)")
-                        
-                        return
-                    } else { throw "v1 server is not supported" }
-                } else { throw "Couldn't fetch client info. The returned data may not be in JSON" }
+        do {
+            let (data, response) = try await self.session.data(from: clientInfoURL)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                self.printOut("Server exposed no /v3/client_info (HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1))")
+                return nil
             }
-        */
+            guard let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] else {
+                self.printOut("/v3/client_info did not return JSON")
+                return nil
+            }
+            let clientInfo = AnisetteClientInfo.sanitized(json["client_info"] as? String, fallback: "")
+            guard !clientInfo.isEmpty else {
+                self.printOut("/v3/client_info advertises a non-Windows identity; using the built-in Windows profile")
+                return nil
+            }
+            let userAgent = (json["user_agent"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            self.printOut("Server client_info: \(clientInfo) user_agent: \(userAgent)")
+            return (clientInfo, userAgent)
+        } catch {
+            self.printOut("Failed to read /v3/client_info: \(error)")
+            return nil
+        }
     }
     
     func fetchAnisetteV3(_ identifier: String, _ adiPb: String) async throws -> AnisetteData {
         try await fetchClientInfo()
         self.printOut("Fetching anisette V3")
-        let url = menuAnisetteURL
         var request = URLRequest(url: self.url!.appendingPathComponent("v3").appendingPathComponent("get_headers"))
         request.httpMethod = "POST"
         request.httpBody = try! JSONSerialization.data(withJSONObject: [
@@ -436,7 +463,7 @@ final class AnisetteDataHelper
             "adi_pb": adiPb
         ], options: [])
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await self.dataWithRetry(for: request)
         
         return try await self.extractAnisetteData(data, response as? HTTPURLResponse, v3: true)
 

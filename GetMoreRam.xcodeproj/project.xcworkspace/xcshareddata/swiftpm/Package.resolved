@@ -58,10 +58,9 @@
     {
       "identity" : "sidesign",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/SideStore/SideSign",
+      "location" : "https://github.com/Mr3242-Scripter/SideSign",
       "state" : {
-        "branch" : "main",
-        "revision" : "752d1ef602aa792a432ffa1e71646dc1ecf7363c"
+        "revision" : "ac3df50c2e55a409b217eec7f14c8949f77365f1"
       }
     },
     {

@@ -11,6 +11,7 @@ import StosSign_Common
 import class SideSign.DeveloperPortal
 import enum SideSign.TwoFactorRequest
 import enum SideSign.TwoFactorResponse
+import struct SideSign.AnisetteData
 
 @MainActor
 class LoginViewModel: ObservableObject {
@@ -80,58 +81,52 @@ class LoginViewModel: ObservableObject {
         }
 
         do {
-            let account: Account
-            let session: AppleAPISession
-            var sideSignTeams: [Team]?
-            if UserDefaults.standard.object(forKey: "UseOnDeviceAnisette") == nil ||
-                UserDefaults.standard.bool(forKey: "UseOnDeviceAnisette") {
-                let anisette = try await OnDeviceAnisetteHelper.shared.getSideSignAnisetteData()
-                let portal = DeveloperPortal()
-                let result = try await portal.authenticate(
-                    appleID: appleID, password: password, anisetteData: anisette,
-                    xcodeVersion: "27.0 (27A5218g)",
-                    accountRepairHandler: { _, _ in .cancel },
-                    verificationHandler: { [weak self] request in
-                        guard let self else { return .cancel }
-                        return await self.handleSideSignVerification(request)
-                    })
-                // Keep StosSign's types for the existing App ID/signing UI only.
-                guard let personID = Int(result.account.identifier) else {
-                    throw "SideSign returned an unsupported account identifier."
-                }
-                let accountData = try JSONSerialization.data(withJSONObject: [
-                    "email": result.account.appleID,
-                    "personId": personID,
-                    "dsFirstName": result.account.firstName,
-                    "dsLastName": result.account.lastName
-                ])
-                account = try JSONDecoder().decode(Account.self, from: accountData)
-                session = AppleAPISession(dsid: result.session.dsid, authToken: result.session.authToken,
-                    anisetteData: try OnDeviceAnisetteHelper.shared.convert(result.session.anisetteData))
-                sideSignTeams = try await portal.fetchTeams(for: result.account, session: result.session).map { team in
-                    let type: TeamType
-                    switch team.type {
-                    case .free: type = .free
-                    case .individual: type = .individual
-                    case .organization: type = .organization
-                    case .unknown: type = .unknown
-                    }
-                    return Team(name: team.name, identifier: team.identifier, type: type, account: account)
-                }
+            // Both supported configurations go through the same SideSign
+            // authentication path (Windows GrandSlam identity, updated 2FA flows,
+            // no connection reuse). Only the Anisette data source differs.
+            let anisette: SideSign.AnisetteData
+            if AnisetteSettings.useOnDeviceAnisette {
+                anisette = try await OnDeviceAnisetteHelper.shared.getSideSignAnisetteData()
             } else {
-                let anisetteData = try await AnisetteDataHelper.shared.getAnisetteData()
-                (account, session) = try await AppleAPI.shared.authenticate(appleID: appleID, password: password, anisetteData: anisetteData) { [weak self] completionHandler in
-                    guard let self else {
-                        completionHandler(nil)
-                        return
-                    }
-
-                    self.prepareForVerification(using: completionHandler)
-                }
+                anisette = try await OnDeviceAnisetteHelper.shared.getRemoteSideSignAnisetteData()
             }
+
+            let portal = DeveloperPortal()
+            let result = try await portal.authenticate(
+                appleID: appleID, password: password, anisetteData: anisette,
+                xcodeVersion: "27.0 (27A5218g)",
+                accountRepairHandler: { _, _ in .cancel },
+                verificationHandler: { [weak self] request in
+                    guard let self else { return .cancel }
+                    return await self.handleSideSignVerification(request)
+                })
 
             guard !isAuthenticationCancellationRequested else {
                 throw CancellationError()
+            }
+
+            // Keep StosSign's types for the existing App ID/signing UI only.
+            guard let personID = Int(result.account.identifier) else {
+                throw "SideSign returned an unsupported account identifier."
+            }
+            let accountData = try JSONSerialization.data(withJSONObject: [
+                "email": result.account.appleID,
+                "personId": personID,
+                "dsFirstName": result.account.firstName,
+                "dsLastName": result.account.lastName
+            ])
+            let account = try JSONDecoder().decode(Account.self, from: accountData)
+            let session = AppleAPISession(dsid: result.session.dsid, authToken: result.session.authToken,
+                anisetteData: try OnDeviceAnisetteHelper.shared.convert(result.session.anisetteData))
+            let teams = try await portal.fetchTeams(for: result.account, session: result.session).map { team in
+                let type: TeamType
+                switch team.type {
+                case .free: type = .free
+                case .individual: type = .individual
+                case .organization: type = .organization
+                case .unknown: type = .unknown
+                }
+                return Team(name: team.name, identifier: team.identifier, type: type, account: account)
             }
 
             logging(text: "Successfully signed in")
@@ -141,12 +136,6 @@ class LoginViewModel: ObservableObject {
             Keychain.shared.appleIDEmailAddress = appleID
             Keychain.shared.appleIDPassword = password
 
-            let teams: [Team]
-            if let sideSignTeams {
-                teams = sideSignTeams
-            } else {
-                teams = try await fetchTeams(for: account, session: session)
-            }
             guard !teams.isEmpty else { throw "Unable to Fetch Team!" }
             logging(text: "Successfully fetched teams")
             availableTeams = teams
@@ -188,16 +177,5 @@ class LoginViewModel: ObservableObject {
             guard let code, !isAuthenticationCancellationRequested else { return .cancel }
             return .verificationCode(code.trimmingCharacters(in: .whitespacesAndNewlines))
         }
-    }
-    
-    func fetchTeams(for account: Account, session: AppleAPISession) async throws -> [Team]
-    {
-
-        let fetchedTeams = try await AppleAPI.shared.fetchTeamsForAccount(account: account, session: session)
-        guard !fetchedTeams.isEmpty else {
-            throw "Unable to Fetch Team!"
-        }
-        
-        return fetchedTeams
     }
 }

@@ -64,7 +64,7 @@ struct SettingsView: View {
                         .disableAutocorrection(true)
                 }
             } footer: {
-                Text("Generates Anisette locally on the iPhone like SideStore. The first run downloads the small ODA runtime package; authentication then goes directly to Apple without an Anisette server. Leave client info empty to use the built-in profile.")
+                Text("Generates Anisette on the iPhone like SideStore. The first run downloads the small ODA runtime package and then talks to Apple without an Anisette server. Leave the client info empty to use the built-in Windows profile; Apple currently rejects Mac/Android identities with error -80045/-80046, so a non-Windows value is ignored.")
             }
 
             Section {
@@ -74,6 +74,8 @@ struct SettingsView: View {
                     TextField("", text: $sharedModel.anisetteServerURL)
                         .multilineTextAlignment(.trailing)
                 }
+            } footer: {
+                Text("Use a v3 server that serves Windows Anisette data, for example https://ani.jkcoxson.com or https://ani2.stikstore.app. It must match the client info above. Changing the server requests a fresh Anisette identity on the next sign in.")
             }
             
             Section {
@@ -253,6 +255,7 @@ struct SettingsView: View {
         Keychain.shared.appleIDPassword = nil
         Keychain.shared.appleIDEmailAddress = nil
         AnisetteDataHelper.shared.resetClientInfo()
+        OnDeviceAnisetteHelper.shared.resetProviderState()
         sharedModel.session = nil
         sharedModel.account = nil
         sharedModel.team = nil
